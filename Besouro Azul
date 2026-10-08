@@ -1,0 +1,1973 @@
+--[[
+	╔══════════════════════════════════════════════════════════════╗
+	║  BESOURO AZUL — ARMADURA TECNOLÓGICA (KHAJI-DA)              ║
+	║  UM ÚNICO LocalScript • sem Script / ModuleScript / Remote   ║
+	╚══════════════════════════════════════════════════════════════╝
+
+	ONDE COLOCAR:
+		StarterPlayer > StarterPlayerScripts > LocalScript
+
+	COMANDOS (digite no chat ou envie pelo seu menu de RP).
+	Pontos, asteriscos, espaços e acentos são ignorados:
+		". Ativar máscara ."  /  "*ativar máscara*"   → liga a armadura + HUD
+		"desativar máscara"                           → desliga tudo
+		"ativar scanner" / "detectar ameaças"         → identifica jogadores
+		"desativar scanner"
+		"visão noturna"  /  "desativar visão noturna"
+		"ativar lâminas" /  "recolher lâminas"
+		"ativar canhões" /  "recolher canhões"
+		"atirar"                                      → rajada (canhões)
+
+	No HUD há botões para tudo (AMEAÇAS, VISÃO, LÂMINAS, CANHÕES, SAIR)
+	e um botão FOGO (segure para metralhar) quando os canhões estão ativos.
+	No PC, clique esquerdo também atira com os canhões ativos.
+
+	IMPORTANTE (LocalScript = só o cliente):
+		• Armadura, lâminas, canhões, projéteis e efeitos só aparecem para VOCÊ.
+		• Os projéteis não causam dano real em ninguém.
+		• A visão noturna altera o Lighting só no seu cliente.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local UserInputService = game:GetService("UserInputService")
+local TextChatService = game:GetService("TextChatService")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Limpa restos de uma execução anterior (caso o script rode de novo)
+for _, name in ipairs({ "BeetleNV_CC", "BeetleNV_Bloom" }) do
+	local old = Lighting:FindFirstChild(name)
+	if old then old:Destroy() end
+end
+do
+	local oldFx = Workspace:FindFirstChild("BeetleFX_Local")
+	if oldFx then oldFx:Destroy() end
+end
+
+-- ═══════════════════════════ CONFIGURAÇÃO ═══════════════════════════
+local CONFIG = {
+	ThreatRange = 800,        -- alcance do scanner (studs)
+	RadarRange = 200,         -- alcance do mini-radar (studs)
+	StudsToMeters = 0.28,     -- conversão para exibir distância em metros
+	ProjectileSpeed = 190,    -- studs/s
+	ProjectileLifetime = 2.2, -- segundos
+	FireInterval = 0.15,      -- tempo entre disparos
+	MaxRayDistance = 500,     -- alcance da mira
+	BladeLength = 3.6,        -- comprimento das lâminas
+	CannonLength = 1.9,       -- comprimento dos canhões
+	Helmet = true,            -- capacete/máscara visual
+}
+
+local COLORS = {
+	Cyan = Color3.fromRGB(0, 224, 255),
+	Blue = Color3.fromRGB(30, 110, 255),
+	Deep = Color3.fromRGB(4, 14, 32),
+	Armor = Color3.fromRGB(14, 40, 104),
+	Armor2 = Color3.fromRGB(8, 22, 54),
+	Threat = Color3.fromRGB(255, 70, 70),
+	Warn = Color3.fromRGB(255, 170, 40),
+	Far = Color3.fromRGB(255, 225, 130),
+	NV = Color3.fromRGB(120, 255, 190),
+	Text = Color3.fromRGB(200, 240, 255),
+	White = Color3.fromRGB(215, 250, 255),
+}
+
+-- ═══════════════════════════ HELPERS ═══════════════════════════
+local function create(className, props)
+	local inst = Instance.new(className)
+	local parent
+	for k, v in pairs(props or {}) do
+		if k == "Parent" then
+			parent = v
+		else
+			inst[k] = v
+		end
+	end
+	if parent then inst.Parent = parent end
+	return inst
+end
+
+local function tween(inst, t, props, style, dir)
+	if t <= 0 then
+		for k, v in pairs(props) do inst[k] = v end
+		return nil
+	end
+	local tw = TweenService:Create(inst, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+local function label(parent, props)
+	local base = {
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = COLORS.Text,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
+		Parent = parent,
+	}
+	for k, v in pairs(props) do base[k] = v end
+	return create("TextLabel", base)
+end
+
+local function addCorner(parent, radius)
+	return create("UICorner", { CornerRadius = radius or UDim.new(0, 6), Parent = parent })
+end
+
+local function addStroke(parent, color, thickness, transparency)
+	return create("UIStroke", {
+		Color = color or COLORS.Cyan,
+		Thickness = thickness or 1.5,
+		Transparency = transparency or 0.2,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = parent,
+	})
+end
+
+-- ═══════════════════════════ ESTADO ═══════════════════════════
+local state = {
+	mask = false,
+	threats = false,
+	night = false,
+	blades = false,
+	cannons = false,
+}
+
+local character, humanoid, rootPart
+
+-- declarações antecipadas
+local setMask, setThreats, setNight, setBlades, setCannons
+local addLog, setButtonState
+
+-- ═══════════════════════════ GUIs ═══════════════════════════
+local function newGui(name, order)
+	local old = playerGui:FindFirstChild(name)
+	if old then old:Destroy() end
+	return create("ScreenGui", {
+		Name = name,
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = order,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		Parent = playerGui,
+	})
+end
+
+local function makeVignette(parent, color, strength)
+	local holder = create("Frame", {
+		Name = "Vignette",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.fromScale(1, 1),
+		Parent = parent,
+	})
+	local function edge(size, pos, anchor, rot)
+		local f = create("Frame", {
+			BackgroundColor3 = color,
+			BorderSizePixel = 0,
+			Size = size,
+			Position = pos,
+			AnchorPoint = anchor,
+			Parent = holder,
+		})
+		create("UIGradient", {
+			Rotation = rot,
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, strength),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+			Parent = f,
+		})
+	end
+	edge(UDim2.fromScale(1, 0.32), UDim2.fromScale(0, 0), Vector2.new(0, 0), 90)
+	edge(UDim2.fromScale(1, 0.32), UDim2.fromScale(0, 1), Vector2.new(0, 1), 270)
+	edge(UDim2.fromScale(0.22, 1), UDim2.fromScale(0, 0), Vector2.new(0, 0), 0)
+	edge(UDim2.fromScale(0.22, 1), UDim2.fromScale(1, 0), Vector2.new(1, 0), 180)
+	return holder
+end
+
+local function makeScanlines(parent, count, transparency, color)
+	local holder = create("Frame", {
+		Name = "Scanlines",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.fromScale(1, 1),
+		Parent = parent,
+	})
+	for i = 0, count - 1 do
+		create("Frame", {
+			BackgroundColor3 = color,
+			BackgroundTransparency = transparency,
+			BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, 1),
+			Position = UDim2.fromScale(0, i / count),
+			Parent = holder,
+		})
+	end
+	return holder
+end
+
+-- ── GUI da visão noturna (fica atrás do HUD) ──
+local nvGui = newGui("BeetleNightVisionGui", 5)
+local nvRoot = create("Frame", {
+	Name = "Root",
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 1),
+	Visible = false,
+	Parent = nvGui,
+})
+create("Frame", {
+	Name = "Tint",
+	BackgroundColor3 = COLORS.NV,
+	BackgroundTransparency = 0.93,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 1),
+	Parent = nvRoot,
+})
+makeVignette(nvRoot, Color3.fromRGB(0, 18, 8), 0.05)
+makeScanlines(nvRoot, 70, 0.9, Color3.fromRGB(0, 0, 0))
+local nvSweep = create("Frame", {
+	Name = "Sweep",
+	BackgroundColor3 = COLORS.NV,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 0.12),
+	Position = UDim2.fromScale(0, -0.12),
+	Parent = nvRoot,
+})
+create("UIGradient", {
+	Rotation = 90,
+	Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.5, 0.86),
+		NumberSequenceKeypoint.new(1, 1),
+	}),
+	Parent = nvSweep,
+})
+label(nvRoot, {
+	Text = "◉ VISÃO NOTURNA ATIVA",
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -8),
+	Size = UDim2.new(0, 220, 0, 14),
+	TextXAlignment = Enum.TextXAlignment.Center,
+	TextColor3 = COLORS.NV,
+	TextSize = 11,
+	Font = Enum.Font.Code,
+})
+local nvFlash = create("Frame", {
+	Name = "Flash",
+	BackgroundColor3 = COLORS.NV,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 1),
+	ZIndex = 50,
+	Parent = nvRoot,
+})
+
+-- ── GUI do HUD ──
+local hudGui = newGui("BeetleHUDGui", 20)
+local hudRoot = create("Frame", {
+	Name = "Root",
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 1),
+	Visible = false,
+	Parent = hudGui,
+})
+
+local hudTint = create("Frame", {
+	Name = "Tint",
+	BackgroundColor3 = COLORS.Blue,
+	BackgroundTransparency = 0.92,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 1),
+	Parent = hudRoot,
+})
+makeVignette(hudRoot, Color3.fromRGB(0, 18, 56), 0.45)
+
+local bootFlash = create("Frame", {
+	Name = "BootFlash",
+	BackgroundColor3 = COLORS.Cyan,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 1),
+	ZIndex = 100,
+	Parent = hudRoot,
+})
+local bootSweep = create("Frame", {
+	Name = "BootSweep",
+	BackgroundColor3 = COLORS.Cyan,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Size = UDim2.new(1, 0, 0, 3),
+	Position = UDim2.fromScale(0, -0.05),
+	ZIndex = 100,
+	Parent = hudRoot,
+})
+
+local function cornerBracket(ax, ay)
+	local f = create("Frame", {
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(ax, ay),
+		Position = UDim2.new(ax, ax == 0 and 8 or -8, ay, ay == 0 and 8 or -8),
+		Size = UDim2.fromOffset(26, 26),
+		Parent = hudRoot,
+	})
+	create("Frame", {
+		AnchorPoint = Vector2.new(ax, ay),
+		Position = UDim2.fromScale(ax, ay),
+		Size = UDim2.new(1, 0, 0, 2),
+		BackgroundColor3 = COLORS.Cyan,
+		BackgroundTransparency = 0.25,
+		BorderSizePixel = 0,
+		Parent = f,
+	})
+	create("Frame", {
+		AnchorPoint = Vector2.new(ax, ay),
+		Position = UDim2.fromScale(ax, ay),
+		Size = UDim2.new(0, 2, 1, 0),
+		BackgroundColor3 = COLORS.Cyan,
+		BackgroundTransparency = 0.25,
+		BorderSizePixel = 0,
+		Parent = f,
+	})
+end
+cornerBracket(0, 0)
+cornerBracket(1, 0)
+cornerBracket(0, 1)
+cornerBracket(1, 1)
+
+-- Camada de marcadores de ameaça
+local threatLayer = create("Frame", {
+	Name = "ThreatLayer",
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 1),
+	Parent = hudRoot,
+})
+
+-- Mira central
+local reticle = create("Frame", {
+	Name = "Reticle",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(84, 84),
+	BackgroundTransparency = 1,
+	Parent = hudRoot,
+})
+local reticleScale = create("UIScale", { Scale = 1, Parent = reticle })
+local reticleRing = create("Frame", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	Parent = reticle,
+})
+addCorner(reticleRing, UDim.new(1, 0))
+local reticleStroke = addStroke(reticleRing, COLORS.Cyan, 1.5, 0.55)
+local reticleSpinner = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromScale(0.78, 0.78),
+	BackgroundTransparency = 1,
+	Parent = reticle,
+})
+local function tick(ax, ay, w, h)
+	create("Frame", {
+		AnchorPoint = Vector2.new(ax, ay),
+		Position = UDim2.fromScale(ax, ay),
+		Size = UDim2.fromOffset(w, h),
+		BackgroundColor3 = COLORS.Cyan,
+		BackgroundTransparency = 0.2,
+		BorderSizePixel = 0,
+		Parent = reticleSpinner,
+	})
+end
+tick(0.5, 0, 2, 9)
+tick(0.5, 1, 2, 9)
+tick(0, 0.5, 9, 2)
+tick(1, 0.5, 9, 2)
+local reticleDot = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(4, 4),
+	BackgroundColor3 = COLORS.Cyan,
+	BorderSizePixel = 0,
+	Parent = reticle,
+})
+addCorner(reticleDot, UDim.new(1, 0))
+
+-- Cabeçalho + barra de energia (decorativa)
+local header = create("Frame", {
+	Name = "Header",
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, -70),
+	Size = UDim2.new(0.92, 0, 0, 46),
+	BackgroundColor3 = COLORS.Deep,
+	BackgroundTransparency = 0.3,
+	BorderSizePixel = 0,
+	Parent = hudRoot,
+})
+addCorner(header, UDim.new(0, 6))
+local headerStroke = addStroke(header, COLORS.Cyan, 1.5, 0.15)
+create("UISizeConstraint", { MaxSize = Vector2.new(440, 46), Parent = header })
+
+local titleLabel = label(header, {
+	Text = "KHAJI-DA  //  SISTEMA ONLINE",
+	Position = UDim2.new(0, 10, 0, 4),
+	Size = UDim2.new(0.62, 0, 0, 16),
+	TextColor3 = COLORS.Cyan,
+	TextSize = 12,
+})
+local targetsLabel = label(header, {
+	Text = "ALVOS: --",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -10, 0, 4),
+	Size = UDim2.new(0.38, -10, 0, 16),
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextSize = 11,
+})
+label(header, {
+	Text = "ENERGIA",
+	Position = UDim2.new(0, 10, 0, 24),
+	Size = UDim2.new(0, 50, 0, 14),
+	TextSize = 10,
+})
+local energyBg = create("Frame", {
+	Position = UDim2.new(0, 64, 0, 26),
+	Size = UDim2.new(1, -116, 0, 10),
+	BackgroundColor3 = Color3.fromRGB(2, 8, 18),
+	BorderSizePixel = 0,
+	Parent = header,
+})
+addCorner(energyBg, UDim.new(0, 3))
+addStroke(energyBg, COLORS.Cyan, 1, 0.5)
+local energyFill = create("Frame", {
+	Size = UDim2.fromScale(0.95, 1),
+	BackgroundColor3 = COLORS.Cyan,
+	BorderSizePixel = 0,
+	Parent = energyBg,
+})
+addCorner(energyFill, UDim.new(0, 3))
+local energyGradient = create("UIGradient", {
+	Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, COLORS.Blue),
+		ColorSequenceKeypoint.new(0.5, COLORS.Cyan),
+		ColorSequenceKeypoint.new(1, COLORS.Blue),
+	}),
+	Parent = energyFill,
+})
+for i = 1, 9 do
+	create("Frame", {
+		Size = UDim2.new(0, 2, 1, 0),
+		Position = UDim2.fromScale(i / 10, 0),
+		BackgroundColor3 = COLORS.Deep,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = energyBg,
+	})
+end
+local energyPct = label(header, {
+	Text = "100%",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -10, 0, 23),
+	Size = UDim2.fromOffset(40, 14),
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextSize = 11,
+	TextColor3 = COLORS.Cyan,
+})
+
+-- Botões do HUD
+local buttonRow = create("Frame", {
+	Name = "Buttons",
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, -60),
+	Size = UDim2.new(0.92, 0, 0, 36),
+	BackgroundTransparency = 1,
+	Parent = hudRoot,
+})
+create("UISizeConstraint", { MaxSize = Vector2.new(440, 36), Parent = buttonRow })
+create("UIGridLayout", {
+	CellSize = UDim2.new(0.19, 0, 1, 0),
+	CellPadding = UDim2.new(0.0125, 0, 0, 0),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	HorizontalAlignment = Enum.HorizontalAlignment.Center,
+	Parent = buttonRow,
+})
+
+local buttons = {}
+local function makeButton(key, text, order, accent, callback)
+	local b = create("TextButton", {
+		Name = key,
+		LayoutOrder = order,
+		AutoButtonColor = false,
+		BackgroundColor3 = COLORS.Deep,
+		BackgroundTransparency = 0.25,
+		BorderSizePixel = 0,
+		Text = text,
+		TextColor3 = COLORS.Text,
+		Font = Enum.Font.GothamBold,
+		TextScaled = true,
+		Parent = buttonRow,
+	})
+	addCorner(b, UDim.new(0, 5))
+	create("UIPadding", {
+		PaddingLeft = UDim.new(0, 3),
+		PaddingRight = UDim.new(0, 3),
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8),
+		Parent = b,
+	})
+	create("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6, Parent = b })
+	local stroke = addStroke(b, COLORS.Cyan, 1.2, 0.35)
+	local bar = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -3),
+		Size = UDim2.new(0.7, 0, 0, 3),
+		BackgroundColor3 = accent,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = b,
+	})
+	addCorner(bar, UDim.new(1, 0))
+	b.Activated:Connect(callback)
+	buttons[key] = { button = b, stroke = stroke, bar = bar, accent = accent }
+end
+
+setButtonState = function(key, on)
+	local b = buttons[key]
+	if not b then return end
+	tween(b.button, 0.2, {
+		BackgroundColor3 = on and b.accent or COLORS.Deep,
+		BackgroundTransparency = on and 0.55 or 0.25,
+	})
+	tween(b.stroke, 0.2, { Color = on and b.accent or COLORS.Cyan, Transparency = on and 0 or 0.35 })
+	tween(b.bar, 0.2, { BackgroundTransparency = on and 0 or 1 })
+end
+
+makeButton("threats", "AMEAÇAS", 1, COLORS.Threat, function() setThreats(not state.threats) end)
+makeButton("night", "VISÃO", 2, COLORS.NV, function() setNight(not state.night) end)
+makeButton("blades", "LÂMINAS", 3, COLORS.Cyan, function() setBlades(not state.blades) end)
+makeButton("cannons", "CANHÕES", 4, COLORS.Blue, function() setCannons(not state.cannons) end)
+makeButton("exit", "SAIR", 5, COLORS.Warn, function() setMask(false) end)
+
+-- Log de status
+local logFrame = create("Frame", {
+	Name = "Log",
+	BackgroundTransparency = 1,
+	Position = UDim2.new(0, -230, 0, 100),
+	Size = UDim2.new(0, 210, 0, 80),
+	Parent = hudRoot,
+})
+create("UIListLayout", {
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	VerticalAlignment = Enum.VerticalAlignment.Top,
+	Parent = logFrame,
+})
+local logCount = 0
+addLog = function(text, color)
+	if not state.mask then return end
+	logCount += 1
+	local l = label(logFrame, {
+		Text = "> " .. text,
+		Size = UDim2.new(1, 0, 0, 14),
+		TextColor3 = color or COLORS.Cyan,
+		TextSize = 11,
+		Font = Enum.Font.Code,
+		LayoutOrder = logCount,
+		TextTransparency = 1,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+	tween(l, 0.25, { TextTransparency = 0 })
+	local lines = {}
+	for _, c in ipairs(logFrame:GetChildren()) do
+		if c:IsA("TextLabel") then table.insert(lines, c) end
+	end
+	table.sort(lines, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+	while #lines > 5 do
+		lines[1]:Destroy()
+		table.remove(lines, 1)
+	end
+	task.delay(6, function()
+		if l.Parent then tween(l, 1, { TextTransparency = 0.6 }) end
+	end)
+end
+
+-- Mini-radar
+local RADAR_SIZE = 92
+local radar = create("Frame", {
+	Name = "Radar",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -12, 0, 100),
+	Size = UDim2.fromOffset(RADAR_SIZE, RADAR_SIZE),
+	BackgroundColor3 = COLORS.Deep,
+	BackgroundTransparency = 0.35,
+	BorderSizePixel = 0,
+	Parent = hudRoot,
+})
+local radarScale = create("UIScale", { Scale = 0, Parent = radar })
+addCorner(radar, UDim.new(1, 0))
+addStroke(radar, COLORS.Cyan, 1.5, 0.15)
+local radarRing = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromScale(0.5, 0.5),
+	BackgroundTransparency = 1,
+	Parent = radar,
+})
+addCorner(radarRing, UDim.new(1, 0))
+addStroke(radarRing, COLORS.Cyan, 1, 0.6)
+create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.new(1, 0, 0, 1),
+	BackgroundColor3 = COLORS.Cyan,
+	BackgroundTransparency = 0.7,
+	BorderSizePixel = 0,
+	Parent = radar,
+})
+create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.new(0, 1, 1, 0),
+	BackgroundColor3 = COLORS.Cyan,
+	BackgroundTransparency = 0.7,
+	BorderSizePixel = 0,
+	Parent = radar,
+})
+local radarSweep = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	Parent = radar,
+})
+local radarLine = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.new(0, 2, 0.5, 0),
+	BackgroundColor3 = COLORS.Cyan,
+	BorderSizePixel = 0,
+	Parent = radarSweep,
+})
+create("UIGradient", {
+	Rotation = 90,
+	Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.9),
+		NumberSequenceKeypoint.new(1, 0),
+	}),
+	Parent = radarLine,
+})
+local radarSelf = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(5, 5),
+	BackgroundColor3 = COLORS.White,
+	BorderSizePixel = 0,
+	Parent = radar,
+})
+addCorner(radarSelf, UDim.new(1, 0))
+
+-- Botão de disparo
+local fireBtn = create("TextButton", {
+	Name = "Fire",
+	AnchorPoint = Vector2.new(1, 1),
+	Position = UDim2.new(1, -150, 1, -40),
+	Size = UDim2.fromOffset(64, 64),
+	AutoButtonColor = false,
+	BackgroundColor3 = COLORS.Deep,
+	BackgroundTransparency = 0.2,
+	BorderSizePixel = 0,
+	Text = "FOGO",
+	TextColor3 = COLORS.Cyan,
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	Visible = false,
+	ZIndex = 10,
+	Parent = hudRoot,
+})
+addCorner(fireBtn, UDim.new(1, 0))
+addStroke(fireBtn, COLORS.Cyan, 2, 0.1)
+
+-- ═══════════════════════════ FX (client-only) ═══════════════════════════
+local fxFolder = create("Folder", { Name = "BeetleFX_Local", Parent = Workspace })
+
+local function mkPart(size, color, material, transparency)
+	local p = Instance.new("Part")
+	p.Size = size
+	p.Color = color
+	p.Material = material or Enum.Material.Metal
+	p.Transparency = transparency or 0
+	p.Anchored = false
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.Massless = true
+	p.CastShadow = false
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	return p
+end
+
+local function weld(base, part, c0, parent)
+	part.CFrame = base.CFrame * c0
+	local w = Instance.new("Weld")
+	w.Part0 = base
+	w.Part1 = part
+	w.C0 = c0
+	w.Parent = part
+	part.Parent = parent
+	return w
+end
+
+local function makeSparks(parent, color)
+	local e = Instance.new("ParticleEmitter")
+	e.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+	e.Color = ColorSequence.new(color or COLORS.Cyan, COLORS.White)
+	e.LightEmission = 1
+	e.Rate = 0
+	e.Lifetime = NumberRange.new(0.3, 0.7)
+	e.Speed = NumberRange.new(6, 16)
+	e.SpreadAngle = Vector2.new(180, 180)
+	e.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.35),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	e.Parent = parent
+	return e
+end
+
+local function rayFilter()
+	local list = { fxFolder }
+	if character then table.insert(list, character) end
+	return list
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+
+-- ═══════════════════════════ ARMADURA VISUAL ═══════════════════════════
+local ARMOR = { folder = nil, parts = {} }
+local blades = {}
+local cannons = {}
+
+local function getMount(side)
+	if not character then return nil end
+	local names = side == "right" and { "RightLowerArm", "Right Arm" } or { "LeftLowerArm", "Left Arm" }
+	for _, n in ipairs(names) do
+		local p = character:FindFirstChild(n)
+		if p and p:IsA("BasePart") then
+			local r6 = (n == "Right Arm" or n == "Left Arm")
+			return {
+				part = p,
+				r6 = r6,
+				yOff = r6 and -0.45 or 0.05,
+				sign = side == "right" and 1 or -1,
+			}
+		end
+	end
+	return nil
+end
+
+local function addArmorPart(part, baseTransparency)
+	table.insert(ARMOR.parts, { part = part, tr = baseTransparency or 0 })
+	part.Transparency = 1
+end
+
+local function buildArmor()
+	if ARMOR.folder or not character then return end
+	local folder = Instance.new("Folder")
+	folder.Name = "BeetleArmor"
+	folder.Parent = character
+	ARMOR.folder = folder
+	ARMOR.parts = {}
+
+	-- Capacete + olhos
+	local head = character:FindFirstChild("Head")
+	if CONFIG.Helmet and head then
+		local shell = mkPart(Vector3.new(1.6, 1.6, 1.6), COLORS.Armor, Enum.Material.Metal)
+		shell.Shape = Enum.PartType.Ball
+		weld(head, shell, CFrame.new(0, 0.05, 0), folder)
+		addArmorPart(shell, 0)
+
+		local crest = mkPart(Vector3.new(0.12, 0.1, 1.1), COLORS.Cyan, Enum.Material.Neon)
+		weld(head, crest, CFrame.new(0, 0.82, 0.05), folder)
+		addArmorPart(crest, 0)
+
+		for s = -1, 1, 2 do
+			local eye = mkPart(Vector3.new(0.36, 0.09, 0.12), COLORS.White, Enum.Material.Neon)
+			weld(head, eye, CFrame.new(s * 0.27, 0.1, -0.74) * CFrame.Angles(0, 0, math.rad(-s * 18)), folder)
+			addArmorPart(eye, 0)
+		end
+	end
+
+	-- Peitoral + escaravelho
+	local chest = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
+	if chest then
+		local zF = -(chest.Size.Z / 2)
+		local cy = chest.Size.Y * 0.12
+		local plate = mkPart(Vector3.new(chest.Size.X * 0.95, chest.Size.Y * 0.6, 0.18), COLORS.Armor, Enum.Material.Metal)
+		weld(chest, plate, CFrame.new(0, cy, zF - 0.06), folder)
+		addArmorPart(plate, 0)
+
+		local core = mkPart(Vector3.new(0.42, 0.42, 0.1), COLORS.Cyan, Enum.Material.Neon)
+		weld(chest, core, CFrame.new(0, cy, zF - 0.19) * CFrame.Angles(0, 0, math.rad(45)), folder)
+		addArmorPart(core, 0)
+
+		for s = -1, 1, 2 do
+			local wing = mkPart(Vector3.new(0.5, 0.07, 0.08), COLORS.Cyan, Enum.Material.Neon)
+			weld(chest, wing, CFrame.new(s * 0.55, cy + 0.05, zF - 0.17) * CFrame.Angles(0, 0, math.rad(-s * 20)), folder)
+			addArmorPart(wing, 0)
+		end
+	end
+
+	-- Braceletes
+	for _, side in ipairs({ "right", "left" }) do
+		local m = getMount(side)
+		if m then
+			local arm = m.part
+			local h = m.r6 and 1.1 or arm.Size.Y * 0.9
+			local shell = mkPart(Vector3.new(arm.Size.X + 0.2, h, arm.Size.Z + 0.2), COLORS.Armor, Enum.Material.Metal)
+			weld(arm, shell, CFrame.new(0, m.yOff, 0), folder)
+			addArmorPart(shell, 0)
+			for _, sy in ipairs({ 1, -1 }) do
+				local stripe = mkPart(Vector3.new(arm.Size.X + 0.23, 0.07, arm.Size.Z + 0.23), COLORS.Cyan, Enum.Material.Neon)
+				weld(arm, stripe, CFrame.new(0, m.yOff + sy * (h / 2 - 0.1), 0), folder)
+				addArmorPart(stripe, 0)
+			end
+		end
+	end
+
+	-- Fade-in escalonado
+	for i, rec in ipairs(ARMOR.parts) do
+		task.delay(i * 0.03, function()
+			if rec.part.Parent then
+				tween(rec.part, 0.45, { Transparency = rec.tr })
+			end
+		end)
+	end
+
+	-- Anel de varredura subindo pelo corpo
+	if rootPart then
+		local ring = Instance.new("Part")
+		ring.Shape = Enum.PartType.Cylinder
+		ring.Size = Vector3.new(0.15, 5.5, 5.5)
+		ring.Color = COLORS.Cyan
+		ring.Material = Enum.Material.Neon
+		ring.Transparency = 0.2
+		ring.Anchored = true
+		ring.CanCollide = false
+		ring.CanTouch = false
+		ring.CanQuery = false
+		ring.CastShadow = false
+		local base = CFrame.new(rootPart.Position - Vector3.new(0, 3, 0)) * CFrame.Angles(0, 0, math.rad(90))
+		ring.CFrame = base
+		ring.Parent = fxFolder
+		tween(ring, 0.8, {
+			CFrame = CFrame.new(rootPart.Position + Vector3.new(0, 3, 0)) * CFrame.Angles(0, 0, math.rad(90)),
+			Transparency = 0.9,
+		}, Enum.EasingStyle.Sine)
+		Debris:AddItem(ring, 1)
+	end
+end
+
+local function removeArmor()
+	local folder = ARMOR.folder
+	if not folder then return end
+	local parts = ARMOR.parts
+	ARMOR.folder = nil
+	ARMOR.parts = {}
+	for _, rec in ipairs(parts) do
+		if rec.part.Parent then
+			tween(rec.part, 0.35, { Transparency = 1 })
+		end
+	end
+	task.delay(0.5, function()
+		if folder.Parent then folder:Destroy() end
+	end)
+end
+
+-- ═══════════════════════════ LÂMINAS ═══════════════════════════
+local function buildBlade(side)
+	local m = getMount(side)
+	if not m then return nil end
+	local arm, sign, y = m.part, m.sign, m.yOff
+	local parent = ARMOR.folder or character
+	local x = sign * (arm.Size.X / 2 + 0.16)
+	local zStart = -(arm.Size.Z / 2) + 0.3
+	local H = 0.5
+	local bodyColor = Color3.fromRGB(18, 44, 110)
+
+	local parts = {}
+	local function reg(p) table.insert(parts, p) return p end
+
+	local mount = reg(mkPart(Vector3.new(0.3, 0.62, 0.62), COLORS.Armor2, Enum.Material.Metal))
+	weld(arm, mount, CFrame.new(x, y, zStart + 0.05), parent)
+
+	local body = reg(mkPart(Vector3.new(0.12, H, 0.1), bodyColor, Enum.Material.Metal))
+	local wBody = weld(arm, body, CFrame.new(x, y, zStart), parent)
+
+	local stripTop = reg(mkPart(Vector3.new(0.14, 0.05, 0.1), COLORS.Cyan, Enum.Material.Neon))
+	local wTop = weld(arm, stripTop, CFrame.new(x, y + H / 2 - 0.02, zStart), parent)
+
+	local stripBot = reg(mkPart(Vector3.new(0.14, 0.05, 0.1), COLORS.Cyan, Enum.Material.Neon))
+	local wBot = weld(arm, stripBot, CFrame.new(x, y - H / 2 + 0.02, zStart), parent)
+
+	local core = reg(mkPart(Vector3.new(0.15, 0.09, 0.1), COLORS.White, Enum.Material.Neon, 0.15))
+	local wCore = weld(arm, core, CFrame.new(x, y, zStart), parent)
+
+	local tip = reg(mkPart(Vector3.new(0.12, 0.3536, 0.3536), bodyColor, Enum.Material.Metal))
+	local wTip = weld(arm, tip, CFrame.new(x, y, zStart) * CFrame.Angles(math.rad(45), 0, 0), parent)
+
+	local light = Instance.new("PointLight")
+	light.Color = COLORS.Cyan
+	light.Range = 9
+	light.Brightness = 2
+	light.Parent = core
+
+	local sparks = makeSparks(tip, COLORS.Cyan)
+
+	local function update(e)
+		local L = math.max(0.06, CONFIG.BladeLength * e)
+		local cz = zStart - L / 2
+		body.Size = Vector3.new(0.12, H, L)
+		wBody.C0 = CFrame.new(x, y, cz)
+		stripTop.Size = Vector3.new(0.14, 0.05, L)
+		wTop.C0 = CFrame.new(x, y + H / 2 - 0.02, cz)
+		stripBot.Size = Vector3.new(0.14, 0.05, L)
+		wBot.C0 = CFrame.new(x, y - H / 2 + 0.02, cz)
+		core.Size = Vector3.new(0.15, 0.09, math.max(0.04, L * 0.9))
+		wCore.C0 = CFrame.new(x, y, cz)
+		wTip.C0 = CFrame.new(x, y, zStart - L) * CFrame.Angles(math.rad(45), 0, 0)
+	end
+
+	local nv = Instance.new("NumberValue")
+	nv.Value = 0
+	nv.Changed:Connect(update)
+	update(0)
+
+	return { parts = parts, nv = nv, sparks = sparks, update = update }
+end
+
+local function extendBlade(b)
+	b.nv.Value = 0
+	tween(b.nv, 0.5, { Value = 1 }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	b.sparks:Emit(24)
+end
+
+local function retractBlade(b)
+	b.sparks:Emit(14)
+	local tw = tween(b.nv, 0.35, { Value = 0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	local function cleanup()
+		b.nv:Destroy()
+		for _, p in ipairs(b.parts) do
+			if p.Parent then p:Destroy() end
+		end
+	end
+	if tw then
+		tw.Completed:Connect(cleanup)
+	else
+		cleanup()
+	end
+end
+
+-- ═══════════════════════════ CANHÕES ═══════════════════════════
+local function buildCannon(side)
+	local m = getMount(side)
+	if not m then return nil end
+	local arm, y = m.part, m.yOff
+	local parent = ARMOR.folder or character
+	local zBase = -(arm.Size.Z / 2)
+	local rot = CFrame.Angles(0, math.rad(90), 0) -- eixo X do cilindro → eixo Z (frente)
+	local parts = {}
+	local function reg(p) table.insert(parts, p) return p end
+
+	local housing = reg(mkPart(Vector3.new(0.64, 0.64, 0.5), COLORS.Armor2, Enum.Material.Metal))
+	weld(arm, housing, CFrame.new(0, y, zBase - 0.02), parent)
+
+	local barrel = reg(mkPart(Vector3.new(0.1, 0.42, 0.42), COLORS.Armor, Enum.Material.Metal))
+	barrel.Shape = Enum.PartType.Cylinder
+	local wBarrel = weld(arm, barrel, CFrame.new(0, y, zBase) * rot, parent)
+
+	local fractions = { 0.3, 0.6, 0.88 }
+	local ringWelds = {}
+	for i = 1, #fractions do
+		local ring = reg(mkPart(Vector3.new(0.07, 0.54, 0.54), COLORS.Cyan, Enum.Material.Neon))
+		ring.Shape = Enum.PartType.Cylinder
+		ringWelds[i] = weld(arm, ring, CFrame.new(0, y, zBase) * rot, parent)
+	end
+
+	local muzzleRing = reg(mkPart(Vector3.new(0.14, 0.62, 0.62), COLORS.Armor2, Enum.Material.Metal))
+	muzzleRing.Shape = Enum.PartType.Cylinder
+	local wMuzzle = weld(arm, muzzleRing, CFrame.new(0, y, zBase) * rot, parent)
+
+	local core = reg(mkPart(Vector3.new(0.3, 0.3, 0.3), COLORS.White, Enum.Material.Neon))
+	core.Shape = Enum.PartType.Ball
+	local wCore = weld(arm, core, CFrame.new(0, y, zBase), parent)
+
+	local light = Instance.new("PointLight")
+	light.Color = COLORS.Cyan
+	light.Range = 10
+	light.Brightness = 2.5
+	light.Parent = core
+
+	local obj = { parts = parts, core = core, ready = false, side = side }
+
+	local function update(e)
+		local Lb = math.max(0.1, CONFIG.CannonLength * e)
+		local z0 = zBase + 0.1
+		barrel.Size = Vector3.new(Lb, 0.42, 0.42)
+		wBarrel.C0 = CFrame.new(0, y, z0 - Lb / 2) * rot
+		for i, f in ipairs(fractions) do
+			ringWelds[i].C0 = CFrame.new(0, y, z0 - Lb * f) * rot
+		end
+		wMuzzle.C0 = CFrame.new(0, y, z0 - Lb) * rot
+		wCore.C0 = CFrame.new(0, y, z0 - Lb - 0.08)
+		obj.ready = e > 0.85
+	end
+
+	local nv = Instance.new("NumberValue")
+	nv.Value = 0
+	nv.Changed:Connect(update)
+	update(0)
+	obj.nv = nv
+	return obj
+end
+
+local function extendCannon(c)
+	c.nv.Value = 0
+	tween(c.nv, 0.6, { Value = 1 }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+end
+
+local function retractCannon(c)
+	c.ready = false
+	local tw = tween(c.nv, 0.4, { Value = 0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	local function cleanup()
+		c.nv:Destroy()
+		for _, p in ipairs(c.parts) do
+			if p.Parent then p:Destroy() end
+		end
+	end
+	if tw then
+		tw.Completed:Connect(cleanup)
+	else
+		cleanup()
+	end
+end
+
+-- ═══════════════════════════ PROJÉTEIS ═══════════════════════════
+local projectiles = {}
+local energyDip = 0
+
+local function impactFx(pos, normal)
+	local face = CFrame.lookAt(pos, pos + normal)
+
+	local ball = Instance.new("Part")
+	ball.Shape = Enum.PartType.Ball
+	ball.Size = Vector3.new(0.6, 0.6, 0.6)
+	ball.Color = COLORS.Cyan
+	ball.Material = Enum.Material.Neon
+	ball.Transparency = 0.1
+	ball.Anchored = true
+	ball.CanCollide = false
+	ball.CanTouch = false
+	ball.CanQuery = false
+	ball.CastShadow = false
+	ball.CFrame = face
+	ball.Parent = fxFolder
+	tween(ball, 0.28, { Size = Vector3.new(4.5, 4.5, 4.5), Transparency = 1 })
+
+	local emitter = makeSparks(ball, COLORS.Cyan)
+	emitter.EmissionDirection = Enum.NormalId.Front
+	emitter.SpreadAngle = Vector2.new(70, 70)
+	emitter.Speed = NumberRange.new(14, 30)
+	emitter:Emit(18)
+	Debris:AddItem(ball, 0.9)
+
+	local ring = Instance.new("Part")
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Size = Vector3.new(0.12, 1, 1)
+	ring.Color = COLORS.White
+	ring.Material = Enum.Material.Neon
+	ring.Transparency = 0.1
+	ring.Anchored = true
+	ring.CanCollide = false
+	ring.CanTouch = false
+	ring.CanQuery = false
+	ring.CastShadow = false
+	ring.CFrame = CFrame.lookAt(pos + normal * 0.05, pos + normal) * CFrame.Angles(0, math.rad(90), 0)
+	ring.Parent = fxFolder
+	tween(ring, 0.35, { Size = Vector3.new(0.12, 9, 9), Transparency = 1 })
+	Debris:AddItem(ring, 0.6)
+end
+
+local function muzzleFlash(pos)
+	local f = Instance.new("Part")
+	f.Shape = Enum.PartType.Ball
+	f.Size = Vector3.new(0.5, 0.5, 0.5)
+	f.Color = COLORS.White
+	f.Material = Enum.Material.Neon
+	f.Transparency = 0.1
+	f.Anchored = true
+	f.CanCollide = false
+	f.CanTouch = false
+	f.CanQuery = false
+	f.CastShadow = false
+	f.Position = pos
+	f.Parent = fxFolder
+	tween(f, 0.14, { Size = Vector3.new(1.4, 1.4, 1.4), Transparency = 1 })
+	Debris:AddItem(f, 0.3)
+end
+
+local function spawnProjectile(origin, dir)
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Ball
+	p.Size = Vector3.new(0.9, 0.9, 0.9)
+	p.Color = COLORS.Cyan
+	p.Material = Enum.Material.Neon
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.CastShadow = false
+	p.CFrame = CFrame.lookAt(origin, origin + dir)
+
+	local a0 = Instance.new("Attachment")
+	a0.Position = Vector3.new(0, 0.35, 0)
+	a0.Parent = p
+	local a1 = Instance.new("Attachment")
+	a1.Position = Vector3.new(0, -0.35, 0)
+	a1.Parent = p
+	local trail = Instance.new("Trail")
+	trail.Attachment0 = a0
+	trail.Attachment1 = a1
+	trail.Lifetime = 0.28
+	trail.Color = ColorSequence.new(COLORS.Cyan, COLORS.Blue)
+	trail.Transparency = NumberSequence.new(0.1, 1)
+	trail.LightEmission = 1
+	trail.FaceCamera = true
+	trail.Parent = p
+
+	local light = Instance.new("PointLight")
+	light.Color = COLORS.Cyan
+	light.Range = 10
+	light.Brightness = 3
+	light.Parent = p
+
+	p.Parent = fxFolder
+	table.insert(projectiles, { part = p, dir = dir, born = os.clock() })
+end
+
+local function updateProjectiles(dt)
+	if #projectiles == 0 then return end
+	rayParams.FilterDescendantsInstances = rayFilter()
+	local now = os.clock()
+	for i = #projectiles, 1, -1 do
+		local pr = projectiles[i]
+		local part = pr.part
+		if not part.Parent then
+			table.remove(projectiles, i)
+		else
+			local step = pr.dir * CONFIG.ProjectileSpeed * dt
+			local pos = part.Position
+			local hit = Workspace:Raycast(pos, step + pr.dir * 0.6, rayParams)
+			if hit then
+				impactFx(hit.Position, hit.Normal)
+				part:Destroy()
+				table.remove(projectiles, i)
+			elseif now - pr.born > CONFIG.ProjectileLifetime then
+				part:Destroy()
+				table.remove(projectiles, i)
+			else
+				local np = pos + step
+				part.CFrame = CFrame.lookAt(np, np + pr.dir)
+			end
+		end
+	end
+end
+
+local shotIndex = 0
+local function fireOnce()
+	if not state.cannons then return end
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+
+	local list = {}
+	for _, side in ipairs({ "right", "left" }) do
+		local c = cannons[side]
+		if c and c.ready and c.core.Parent then table.insert(list, c) end
+	end
+	if #list == 0 then return end
+
+	rayParams.FilterDescendantsInstances = rayFilter()
+	local origin = cam.CFrame.Position
+	local look = cam.CFrame.LookVector
+	local res = Workspace:Raycast(origin, look * CONFIG.MaxRayDistance, rayParams)
+	local target = res and res.Position or (origin + look * CONFIG.MaxRayDistance)
+
+	shotIndex = shotIndex % #list + 1
+	local c = list[shotIndex]
+	local muzzle = c.core.Position
+	local dir = target - muzzle
+	if dir.Magnitude < 1 then dir = look else dir = dir.Unit end
+
+	muzzleFlash(muzzle)
+	spawnProjectile(muzzle + dir * 0.4, dir)
+	energyDip = 0.1
+end
+
+local function fireBurst(n)
+	task.spawn(function()
+		for _ = 1, n do
+			if not state.cannons then break end
+			fireOnce()
+			task.wait(CONFIG.FireInterval)
+		end
+	end)
+end
+
+-- Entradas de disparo
+local firing = false
+local mouseHeld = false
+local firePointerInput = nil
+local lastShot = 0
+
+fireBtn.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		firing = true
+		firePointerInput = input
+	end
+end)
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 and state.cannons then
+		mouseHeld = true
+	end
+end)
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		mouseHeld = false
+	end
+	if input == firePointerInput then
+		firing = false
+		firePointerInput = nil
+	end
+end)
+
+-- ═══════════════════════════ VISÃO NOTURNA ═══════════════════════════
+local nvEffects = {
+	cc = create("ColorCorrectionEffect", { Name = "BeetleNV_CC", Enabled = false, Parent = Lighting }),
+	bloom = create("BloomEffect", {
+		Name = "BeetleNV_Bloom",
+		Enabled = false,
+		Intensity = 0,
+		Size = 24,
+		Threshold = 2,
+		Parent = Lighting,
+	}),
+}
+local nvSaved = nil
+local nvToken = 0
+
+local function applyNight(on, instant)
+	nvToken += 1
+	local token = nvToken
+	local dur = instant and 0 or 0.6
+	if on then
+		nvSaved = nvSaved or {
+			Ambient = Lighting.Ambient,
+			OutdoorAmbient = Lighting.OutdoorAmbient,
+			Exposure = Lighting.ExposureCompensation,
+		}
+		nvEffects.cc.Enabled = true
+		nvEffects.bloom.Enabled = true
+		nvRoot.Visible = true
+		tween(nvEffects.cc, dur, {
+			Brightness = 0.12,
+			Contrast = 0.35,
+			Saturation = -0.55,
+			TintColor = Color3.fromRGB(120, 255, 185),
+		})
+		tween(nvEffects.bloom, dur, { Intensity = 0.9, Threshold = 0.7 })
+		tween(Lighting, dur, {
+			Ambient = Color3.fromRGB(95, 150, 125),
+			OutdoorAmbient = Color3.fromRGB(95, 150, 125),
+			ExposureCompensation = nvSaved.Exposure + 0.9,
+		})
+		nvFlash.BackgroundTransparency = 0.25
+		tween(nvFlash, 0.5, { BackgroundTransparency = 1 })
+	else
+		if nvSaved then
+			local s = nvSaved
+			nvSaved = nil
+			tween(Lighting, dur, {
+				Ambient = s.Ambient,
+				OutdoorAmbient = s.OutdoorAmbient,
+				ExposureCompensation = s.Exposure,
+			})
+		end
+		tween(nvEffects.cc, dur, {
+			Brightness = 0,
+			Contrast = 0,
+			Saturation = 0,
+			TintColor = Color3.new(1, 1, 1),
+		})
+		tween(nvEffects.bloom, dur, { Intensity = 0, Threshold = 2 })
+		if not instant then
+			nvFlash.BackgroundTransparency = 0.45
+			tween(nvFlash, 0.4, { BackgroundTransparency = 1 })
+		end
+		local function finish()
+			if token == nvToken then
+				nvEffects.cc.Enabled = false
+				nvEffects.bloom.Enabled = false
+				nvRoot.Visible = false
+			end
+		end
+		if instant then finish() else task.delay(dur + 0.05, finish) end
+	end
+end
+
+-- ═══════════════════════════ AMEAÇAS ═══════════════════════════
+local markers = {}
+local lastTextUpdate = 0
+local lastAlert = 0
+
+local function bandFor(meters)
+	if meters < 35 then return 1, COLORS.Threat end
+	if meters < 90 then return 2, COLORS.Warn end
+	return 3, COLORS.Far
+end
+
+local function createMarker(plr)
+	local frame = create("Frame", {
+		Name = plr.Name,
+		AnchorPoint = Vector2.new(0.5, 0),
+		BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(110, 44),
+		Visible = false,
+		Parent = threatLayer,
+	})
+	local diamond = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0),
+		Size = UDim2.fromOffset(22, 22),
+		Rotation = 45,
+		BackgroundTransparency = 1,
+		Parent = frame,
+	})
+	local stroke = addStroke(diamond, COLORS.Threat, 2, 0)
+	local dot = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0),
+		Size = UDim2.fromOffset(6, 6),
+		BackgroundColor3 = COLORS.Threat,
+		BorderSizePixel = 0,
+		Parent = frame,
+	})
+	addCorner(dot, UDim.new(1, 0))
+	local arrow = label(frame, {
+		Text = "▲",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0),
+		Size = UDim2.fromOffset(24, 24),
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextSize = 22,
+		TextColor3 = COLORS.Threat,
+		Visible = false,
+	})
+	local nameLabel = label(frame, {
+		Text = plr.DisplayName,
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 16),
+		Size = UDim2.fromOffset(110, 13),
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextSize = 11,
+		TextColor3 = COLORS.White,
+		TextStrokeTransparency = 0.5,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+	local distLabel = label(frame, {
+		Text = "--",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 29),
+		Size = UDim2.fromOffset(110, 12),
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextSize = 11,
+		Font = Enum.Font.Code,
+		TextColor3 = COLORS.Threat,
+		TextStrokeTransparency = 0.5,
+	})
+	local radarDot = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.fromOffset(6, 6),
+		BackgroundColor3 = COLORS.Threat,
+		BorderSizePixel = 0,
+		Parent = radar,
+	})
+	addCorner(radarDot, UDim.new(1, 0))
+
+	local m = {
+		frame = frame,
+		diamond = diamond,
+		stroke = stroke,
+		dot = dot,
+		arrow = arrow,
+		nameLabel = nameLabel,
+		distLabel = distLabel,
+		radarDot = radarDot,
+		highlight = nil,
+		band = 0,
+	}
+	markers[plr] = m
+	return m
+end
+
+local function destroyMarker(plr)
+	local m = markers[plr]
+	if not m then return end
+	markers[plr] = nil
+	if m.frame then m.frame:Destroy() end
+	if m.radarDot then m.radarDot:Destroy() end
+	if m.highlight then m.highlight:Destroy() end
+end
+
+local function clearThreats()
+	for plr in pairs(markers) do
+		destroyMarker(plr)
+	end
+end
+
+local function ensureHighlight(m, char)
+	if m.highlight and m.highlight.Parent == char then return end
+	if m.highlight then m.highlight:Destroy() end
+	m.highlight = create("Highlight", {
+		Name = "BeetleThreatHL",
+		FillColor = COLORS.Threat,
+		FillTransparency = 0.82,
+		OutlineColor = COLORS.Threat,
+		OutlineTransparency = 0.15,
+		DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+		Adornee = char,
+		Parent = char,
+	})
+end
+
+local function updateThreats(t)
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	local camCF = cam.CFrame
+	local camPos = camCF.Position
+	local view = cam.ViewportSize
+	local center = view / 2
+	local halfW = math.max(40, view.X / 2 - 56)
+	local halfH = math.max(40, view.Y / 2 - 60)
+
+	local look = camCF.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) else flat = flat.Unit end
+	local right = flat:Cross(Vector3.yAxis)
+
+	local doText = (t - lastTextUpdate) > 0.12
+	if doText then lastTextUpdate = t end
+
+	local origin = rootPart and rootPart.Position or camPos
+	local seen = {}
+	local count, nearest = 0, math.huge
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then
+			local char = plr.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hrp and hum and hum.Health > 0 then
+				local dist = (hrp.Position - origin).Magnitude
+				if dist <= CONFIG.ThreatRange then
+					seen[plr] = true
+					count += 1
+					if dist < nearest then nearest = dist end
+
+					local m = markers[plr] or createMarker(plr)
+					local meters = dist * CONFIG.StudsToMeters
+					local band, color = bandFor(meters)
+					if m.band ~= band then
+						m.band = band
+						m.stroke.Color = color
+						m.dot.BackgroundColor3 = color
+						m.arrow.TextColor3 = color
+						m.distLabel.TextColor3 = color
+						m.radarDot.BackgroundColor3 = color
+					end
+					ensureHighlight(m, char)
+
+					-- posição na tela
+					local vp, onScreen = cam:WorldToViewportPoint(hrp.Position)
+					local pos
+					if onScreen then
+						pos = Vector2.new(vp.X, vp.Y)
+						m.diamond.Visible = true
+						m.dot.Visible = true
+						m.arrow.Visible = false
+					else
+						local rel = camCF:PointToObjectSpace(hrp.Position)
+						local dir = Vector2.new(rel.X, -rel.Y)
+						if dir.Magnitude < 0.001 then dir = Vector2.new(0, 1) end
+						dir = dir.Unit
+						local sx = dir.X ~= 0 and halfW / math.abs(dir.X) or math.huge
+						local sy = dir.Y ~= 0 and halfH / math.abs(dir.Y) or math.huge
+						pos = center + dir * math.min(sx, sy)
+						m.diamond.Visible = false
+						m.dot.Visible = false
+						m.arrow.Visible = true
+						m.arrow.Rotation = math.deg(math.atan2(dir.X, -dir.Y))
+					end
+					m.frame.Position = UDim2.fromOffset(pos.X, pos.Y)
+					m.frame.Visible = true
+
+					if doText then
+						m.distLabel.Text = string.format("%dm", math.floor(meters + 0.5))
+						m.nameLabel.Text = plr.DisplayName
+					end
+
+					-- radar
+					local delta = hrp.Position - camPos
+					local v = Vector2.new(delta:Dot(right), -delta:Dot(flat)) / CONFIG.RadarRange
+					if v.Magnitude > 1 then v = v.Unit end
+					local r = RADAR_SIZE / 2 - 5
+					m.radarDot.Position = UDim2.new(0.5, v.X * r, 0.5, v.Y * r)
+				end
+			end
+		end
+	end
+
+	for plr in pairs(markers) do
+		if not seen[plr] then destroyMarker(plr) end
+	end
+
+	if doText then
+		if count > 0 then
+			local nm = nearest * CONFIG.StudsToMeters
+			targetsLabel.Text = string.format("ALVOS: %d | PERTO: %dm", count, math.floor(nm + 0.5))
+			targetsLabel.TextColor3 = nm < 35 and COLORS.Threat or COLORS.Text
+			if nm < 15 and t - lastAlert > 5 then
+				lastAlert = t
+				addLog("ALERTA: ALVO PRÓXIMO", COLORS.Threat)
+				headerStroke.Color = COLORS.Threat
+				tween(headerStroke, 0.8, { Color = COLORS.Cyan })
+			end
+		else
+			targetsLabel.Text = "ALVOS: 0"
+			targetsLabel.TextColor3 = COLORS.Text
+		end
+	end
+end
+
+local pulseToken = 0
+local function startPulse()
+	pulseToken += 1
+	local token = pulseToken
+	task.spawn(function()
+		while state.threats and state.mask and token == pulseToken do
+			local ring = create("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				Size = UDim2.fromOffset(20, 20),
+				BackgroundTransparency = 1,
+				Parent = hudRoot,
+			})
+			addCorner(ring, UDim.new(1, 0))
+			local stroke = create("UIStroke", {
+				Color = COLORS.Cyan,
+				Thickness = 2,
+				Transparency = 0.2,
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				Parent = ring,
+			})
+			tween(ring, 1.8, { Size = UDim2.fromOffset(900, 900) })
+			tween(stroke, 1.8, { Transparency = 1 })
+			Debris:AddItem(ring, 2)
+			task.wait(2.4)
+		end
+	end)
+end
+
+-- ═══════════════════════════ MOSTRAR / ESCONDER HUD ═══════════════════════════
+local hudToken = 0
+
+local function showHUD()
+	hudToken += 1
+	hudRoot.Visible = true
+
+	header.Position = UDim2.new(0.5, 0, 0, -70)
+	buttonRow.Position = UDim2.new(0.5, 0, 0, -60)
+	logFrame.Position = UDim2.new(0, -230, 0, 100)
+	radarScale.Scale = 0
+	hudTint.BackgroundTransparency = 1
+	bootFlash.BackgroundTransparency = 0.55
+	bootSweep.BackgroundTransparency = 0.2
+	bootSweep.Position = UDim2.fromScale(0, -0.05)
+	targetsLabel.Text = "ALVOS: --"
+	targetsLabel.TextColor3 = COLORS.Text
+
+	tween(bootFlash, 0.7, { BackgroundTransparency = 1 })
+	tween(bootSweep, 0.9, { Position = UDim2.fromScale(0, 1.05) }, Enum.EasingStyle.Sine)
+	tween(bootSweep, 0.9, { BackgroundTransparency = 1 })
+	tween(header, 0.55, { Position = UDim2.new(0.5, 0, 0, 6) }, Enum.EasingStyle.Back)
+	tween(buttonRow, 0.6, { Position = UDim2.new(0.5, 0, 0, 54) }, Enum.EasingStyle.Back)
+	tween(logFrame, 0.5, { Position = UDim2.new(0, 10, 0, 100) })
+	tween(radarScale, 0.6, { Scale = 1 }, Enum.EasingStyle.Back)
+	tween(hudTint, 0.8, { BackgroundTransparency = 0.92 })
+
+	task.delay(0.15, function() addLog("KHAJI-DA: ONLINE", COLORS.Cyan) end)
+	task.delay(0.55, function() addLog("SINCRONIZANDO HOSPEDEIRO", COLORS.Text) end)
+	task.delay(0.95, function() addLog("HUD OPERACIONAL", COLORS.Cyan) end)
+end
+
+local function hideHUD()
+	hudToken += 1
+	local token = hudToken
+	fireBtn.Visible = false
+	tween(header, 0.35, { Position = UDim2.new(0.5, 0, 0, -70) }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	tween(buttonRow, 0.35, { Position = UDim2.new(0.5, 0, 0, -60) }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	tween(logFrame, 0.35, { Position = UDim2.new(0, -230, 0, 100) })
+	tween(radarScale, 0.3, { Scale = 0 })
+	tween(hudTint, 0.3, { BackgroundTransparency = 1 })
+	task.delay(0.45, function()
+		if token == hudToken then
+			hudRoot.Visible = false
+			for _, c in ipairs(logFrame:GetChildren()) do
+				if c:IsA("TextLabel") then c:Destroy() end
+			end
+		end
+	end)
+end
+
+-- ═══════════════════════════ AÇÕES (setters) ═══════════════════════════
+local function ensureMask()
+	if not state.mask then setMask(true) end
+	return state.mask
+end
+
+setMask = function(on)
+	if on == state.mask then return end
+	if on then
+		if not character or not character.Parent or not rootPart then return end
+		state.mask = true
+		buildArmor()
+		showHUD()
+	else
+		state.mask = false
+		setThreats(false)
+		setNight(false)
+		setBlades(false)
+		setCannons(false)
+		firing = false
+		mouseHeld = false
+		hideHUD()
+		removeArmor()
+	end
+end
+
+setThreats = function(on)
+	if on == state.threats then return end
+	if on then
+		if not ensureMask() then return end
+		state.threats = true
+		setButtonState("threats", true)
+		addLog("SCANNER DE AMEAÇAS: ON", COLORS.Warn)
+		startPulse()
+	else
+		state.threats = false
+		setButtonState("threats", false)
+		addLog("SCANNER: OFF", COLORS.Text)
+		clearThreats()
+		targetsLabel.Text = "ALVOS: --"
+		targetsLabel.TextColor3 = COLORS.Text
+	end
+end
+
+setNight = function(on)
+	if on == state.night then return end
+	if on then
+		if not ensureMask() then return end
+		state.night = true
+		setButtonState("night", true)
+		applyNight(true)
+		addLog("VISÃO NOTURNA: ON", COLORS.NV)
+	else
+		state.night = false
+		setButtonState("night", false)
+		applyNight(false)
+		addLog("VISÃO NOTURNA: OFF", COLORS.Text)
+	end
+end
+
+setBlades = function(on)
+	if on == state.blades then return end
+	if on then
+		if not ensureMask() then return end
+		state.blades = true
+		setButtonState("blades", true)
+		addLog("LÂMINAS: EXTENDIDAS", COLORS.Cyan)
+		for _, side in ipairs({ "right", "left" }) do
+			local b = buildBlade(side)
+			if b then
+				blades[side] = b
+				extendBlade(b)
+			end
+		end
+	else
+		state.blades = false
+		setButtonState("blades", false)
+		addLog("LÂMINAS: RECOLHIDAS", COLORS.Text)
+		for side, b in pairs(blades) do
+			blades[side] = nil
+			retractBlade(b)
+		end
+	end
+end
+
+setCannons = function(on)
+	if on == state.cannons then return end
+	if on then
+		if not ensureMask() then return end
+		state.cannons = true
+		setButtonState("cannons", true)
+		addLog("CANHÕES: ARMADOS", COLORS.Blue)
+		for _, side in ipairs({ "right", "left" }) do
+			local c = buildCannon(side)
+			if c then
+				cannons[side] = c
+				extendCannon(c)
+			end
+		end
+		fireBtn.Visible = true
+		tween(reticleScale, 0.3, { Scale = 1.2 })
+		tween(reticleStroke, 0.3, { Color = COLORS.White, Transparency = 0.1 })
+	else
+		state.cannons = false
+		setButtonState("cannons", false)
+		addLog("CANHÕES: RECOLHIDOS", COLORS.Text)
+		firing = false
+		mouseHeld = false
+		fireBtn.Visible = false
+		tween(reticleScale, 0.3, { Scale = 1 })
+		tween(reticleStroke, 0.3, { Color = COLORS.Cyan, Transparency = 0.55 })
+		for side, c in pairs(cannons) do
+			cannons[side] = nil
+			retractCannon(c)
+		end
+	end
+end
+
+-- Reset duro (respawn / morte): sem animações
+local function hardReset()
+	state.mask = false
+	state.threats = false
+	state.night = false
+	state.blades = false
+	state.cannons = false
+	firing = false
+	mouseHeld = false
+	pulseToken += 1
+	hudToken += 1
+
+	clearThreats()
+	applyNight(false, true)
+
+	for _, p in ipairs(projectiles) do
+		if p.part then p.part:Destroy() end
+	end
+	projectiles = {}
+	blades = {}
+	cannons = {}
+	if ARMOR.folder then ARMOR.folder:Destroy() end
+	ARMOR.folder = nil
+	ARMOR.parts = {}
+
+	hudRoot.Visible = false
+	fireBtn.Visible = false
+	for key in pairs(buttons) do setButtonState(key, false) end
+	reticleScale.Scale = 1
+	reticleStroke.Color = COLORS.Cyan
+	reticleStroke.Transparency = 0.55
+	for _, c in ipairs(logFrame:GetChildren()) do
+		if c:IsA("TextLabel") then c:Destroy() end
+	end
+end
+
+-- ═══════════════════════════ COMANDOS DE CHAT ═══════════════════════════
+local ACCENTS = {
+	["á"] = "a", ["à"] = "a", ["â"] = "a", ["ã"] = "a", ["ä"] = "a",
+	["é"] = "e", ["è"] = "e", ["ê"] = "e", ["ë"] = "e",
+	["í"] = "i", ["ì"] = "i", ["î"] = "i", ["ï"] = "i",
+	["ó"] = "o", ["ò"] = "o", ["ô"] = "o", ["õ"] = "o", ["ö"] = "o",
+	["ú"] = "u", ["ù"] = "u", ["û"] = "u", ["ü"] = "u",
+	["ç"] = "c",
+	["Á"] = "a", ["À"] = "a", ["Â"] = "a", ["Ã"] = "a", ["Ä"] = "a",
+	["É"] = "e", ["È"] = "e", ["Ê"] = "e", ["Ë"] = "e",
+	["Í"] = "i", ["Ì"] = "i", ["Î"] = "i", ["Ï"] = "i",
+	["Ó"] = "o", ["Ò"] = "o", ["Ô"] = "o", ["Õ"] = "o", ["Ö"] = "o",
+	["Ú"] = "u", ["Ù"] = "u", ["Û"] = "u", ["Ü"] = "u",
+	["Ç"] = "c",
+}
+
+local function normalize(text)
+	text = string.lower(text)
+	for from, to in pairs(ACCENTS) do
+		text = string.gsub(text, from, to)
+	end
+	text = string.gsub(text, "[^%a%d]", "")
+	text = string.gsub(text, "dobesouroazul$", "")
+	text = string.gsub(text, "besouroazul$", "")
+	return text
+end
+
+local COMMANDS = {}
+local function addCommands(fn, list)
+	for _, word in ipairs(list) do COMMANDS[word] = fn end
+end
+
+addCommands(function() setMask(true) end, {
+	"ativarmascara", "ligarmascara", "ativararmadura", "ativarhud", "ativarcapacete",
+})
+addCommands(function() setMask(false) end, {
+	"desativarmascara", "desligarmascara", "desativararmadura", "desativarhud",
+	"tirarmascara", "removermascara",
+})
+addCommands(function() setThreats(true) end, {
+	"ativarscanner", "ativaridentificacao", "identificarameacas", "detectarameacas",
+	"ativardeteccao", "ativarradar", "escanear", "ativarameacas",
+})
+addCommands(function() setThreats(false) end, {
+	"desativarscanner", "desativardeteccao", "desativarradar", "desativarameacas",
+	"desativaridentificacao",
+})
+addCommands(function() setNight(true) end, {
+	"ativarvisaonoturna", "visaonoturna", "ligarvisaonoturna",
+})
+addCommands(function() setNight(false) end, {
+	"desativarvisaonoturna", "desligarvisaonoturna",
+})
+addCommands(function() setBlades(true) end, {
+	"ativarlaminas", "laminas", "extrairlaminas", "sacarlaminas",
+})
+addCommands(function() setBlades(false) end, {
+	"desativarlaminas", "recolherlaminas", "guardarlaminas", "desligarlaminas",
+})
+addCommands(function() setCannons(true) end, {
+	"ativarcanhoes", "canhoes", "ativarcanhao", "canhao",
+})
+addCommands(function() setCannons(false) end, {
+	"desativarcanhoes", "recolhercanhoes", "guardarcanhoes", "desativarcanhao",
+})
+addCommands(function()
+	if not state.cannons then
+		setCannons(true)
+		task.wait(0.7)
+	end
+	fireBurst(4)
+end, { "atirar", "disparar", "fogo" })
+
+local lastCmd, lastCmdTime = "", 0
+local function onChat(message)
+	if type(message) ~= "string" or message == "" then return end
+	local key = normalize(message)
+	local handler = COMMANDS[key]
+	if not handler then return end
+	local now = os.clock()
+	if key == lastCmd and now - lastCmdTime < 0.5 then return end -- evita duplicidade (chat legado + novo)
+	lastCmd, lastCmdTime = key, now
+	task.spawn(handler)
+end
+
+player.Chatted:Connect(onChat)
+pcall(function()
+	TextChatService.MessageReceived:Connect(function(msg)
+		local src = msg.TextSource
+		if src and src.UserId == player.UserId then
+			onChat(msg.Text)
+		end
+	end)
+end)
+
+-- ═══════════════════════════ LOOP PRINCIPAL ═══════════════════════════
+local lastEnergy = 0
+
+RunService.RenderStepped:Connect(function(dt)
+	local t = os.clock()
+
+	-- Visão noturna: varredura + cintilação
+	if state.night then
+		nvSweep.Position = UDim2.fromScale(0, ((t * 0.45) % 1.3) - 0.14)
+		nvRoot.Tint.BackgroundTransparency = 0.91 + math.random() * 0.04
+	end
+
+	if not state.mask then return end
+
+	-- Mira girando
+	reticleSpinner.Rotation = (t * 40) % 360
+	radarSweep.Rotation = (t * 150) % 360
+
+	-- Barra de energia (decorativa)
+	energyDip = math.max(0, energyDip - dt * 0.35)
+	if t - lastEnergy > 0.08 then
+		lastEnergy = t
+		local v = 0.9 + 0.07 * math.sin(t * 1.7) + 0.02 * math.sin(t * 9.3) - energyDip
+		v = math.clamp(v, 0.05, 1)
+		energyFill.Size = UDim2.fromScale(v, 1)
+		energyPct.Text = string.format("%d%%", math.floor(v * 100))
+	end
+	energyGradient.Offset = Vector2.new(math.sin(t * 1.6) * 0.35, 0)
+
+	-- Scanner de ameaças
+	if state.threats then
+		updateThreats(t)
+	end
+
+	-- Canhões: pulso do núcleo + disparo contínuo
+	if state.cannons then
+		for _, c in pairs(cannons) do
+			if c.ready and c.core.Parent then
+				local s = 0.3 + 0.07 * math.sin(t * 8)
+				c.core.Size = Vector3.new(s, s, s)
+			end
+		end
+		if firePointerInput and firePointerInput.UserInputState == Enum.UserInputState.End then
+			firing = false
+			firePointerInput = nil
+		end
+		if (firing or mouseHeld) and t - lastShot >= CONFIG.FireInterval then
+			lastShot = t
+			fireOnce()
+		end
+	end
+end)
+
+RunService.Heartbeat:Connect(updateProjectiles)
+
+-- ═══════════════════════════ PERSONAGEM ═══════════════════════════
+local diedConn
+
+local function onCharacter(char)
+	character = char
+	humanoid = char:WaitForChild("Humanoid", 10)
+	rootPart = char:WaitForChild("HumanoidRootPart", 10)
+	hardReset()
+	if diedConn then diedConn:Disconnect() end
+	if humanoid then
+		diedConn = humanoid.Died:Connect(hardReset)
+	end
+end
+
+player.CharacterAdded:Connect(onCharacter)
+if player.Character then
+	task.spawn(onCharacter, player.Character)
+end
