@@ -23,7 +23,7 @@
 	No PC, clique esquerdo também atira com os canhões ativos.
 
 	IMPORTANTE (LocalScript = só o cliente):
-		• Armadura, lâminas, canhões, projéteis e efeitos só aparecem para VOCÊ.
+		• Lâminas, canhões, projéteis e efeitos só aparecem para VOCÊ.
 		• Os projéteis não causam dano real em ninguém.
 		• A visão noturna altera o Lighting só no seu cliente.
 ]]
@@ -61,7 +61,6 @@ local CONFIG = {
 	MaxRayDistance = 500,     -- alcance da mira
 	BladeLength = 3.6,        -- comprimento das lâminas
 	CannonLength = 1.9,       -- comprimento dos canhões
-	Helmet = true,            -- capacete/máscara visual
 }
 
 local COLORS = {
@@ -788,71 +787,6 @@ local function buildArmor()
 	folder.Parent = character
 	ARMOR.folder = folder
 	ARMOR.parts = {}
-
-	-- Capacete + olhos
-	local head = character:FindFirstChild("Head")
-	if CONFIG.Helmet and head then
-		local shell = mkPart(Vector3.new(1.6, 1.6, 1.6), COLORS.Armor, Enum.Material.Metal)
-		shell.Shape = Enum.PartType.Ball
-		weld(head, shell, CFrame.new(0, 0.05, 0), folder)
-		addArmorPart(shell, 0)
-
-		local crest = mkPart(Vector3.new(0.12, 0.1, 1.1), COLORS.Cyan, Enum.Material.Neon)
-		weld(head, crest, CFrame.new(0, 0.82, 0.05), folder)
-		addArmorPart(crest, 0)
-
-		for s = -1, 1, 2 do
-			local eye = mkPart(Vector3.new(0.36, 0.09, 0.12), COLORS.White, Enum.Material.Neon)
-			weld(head, eye, CFrame.new(s * 0.27, 0.1, -0.74) * CFrame.Angles(0, 0, math.rad(-s * 18)), folder)
-			addArmorPart(eye, 0)
-		end
-	end
-
-	-- Peitoral + escaravelho
-	local chest = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
-	if chest then
-		local zF = -(chest.Size.Z / 2)
-		local cy = chest.Size.Y * 0.12
-		local plate = mkPart(Vector3.new(chest.Size.X * 0.95, chest.Size.Y * 0.6, 0.18), COLORS.Armor, Enum.Material.Metal)
-		weld(chest, plate, CFrame.new(0, cy, zF - 0.06), folder)
-		addArmorPart(plate, 0)
-
-		local core = mkPart(Vector3.new(0.42, 0.42, 0.1), COLORS.Cyan, Enum.Material.Neon)
-		weld(chest, core, CFrame.new(0, cy, zF - 0.19) * CFrame.Angles(0, 0, math.rad(45)), folder)
-		addArmorPart(core, 0)
-
-		for s = -1, 1, 2 do
-			local wing = mkPart(Vector3.new(0.5, 0.07, 0.08), COLORS.Cyan, Enum.Material.Neon)
-			weld(chest, wing, CFrame.new(s * 0.55, cy + 0.05, zF - 0.17) * CFrame.Angles(0, 0, math.rad(-s * 20)), folder)
-			addArmorPart(wing, 0)
-		end
-	end
-
-	-- Braceletes
-	for _, side in ipairs({ "right", "left" }) do
-		local m = getMount(side)
-		if m then
-			local arm = m.part
-			local h = m.r6 and 1.1 or arm.Size.Y * 0.9
-			local shell = mkPart(Vector3.new(arm.Size.X + 0.2, h, arm.Size.Z + 0.2), COLORS.Armor, Enum.Material.Metal)
-			weld(arm, shell, CFrame.new(0, m.yOff, 0), folder)
-			addArmorPart(shell, 0)
-			for _, sy in ipairs({ 1, -1 }) do
-				local stripe = mkPart(Vector3.new(arm.Size.X + 0.23, 0.07, arm.Size.Z + 0.23), COLORS.Cyan, Enum.Material.Neon)
-				weld(arm, stripe, CFrame.new(0, m.yOff + sy * (h / 2 - 0.1), 0), folder)
-				addArmorPart(stripe, 0)
-			end
-		end
-	end
-
-	-- Fade-in escalonado
-	for i, rec in ipairs(ARMOR.parts) do
-		task.delay(i * 0.03, function()
-			if rec.part.Parent then
-				tween(rec.part, 0.45, { Transparency = rec.tr })
-			end
-		end)
-	end
 
 	-- Anel de varredura subindo pelo corpo
 	if rootPart then
